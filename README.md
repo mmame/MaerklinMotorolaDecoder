@@ -5,3 +5,5 @@ This Arduino Project implements a simple Maerklin Motorola (2) MM2 Functio/Signa
 
 The Decoder also works on ATTiny85 so you can build very cheap MM2 decoders ;-)
 
+**Example-Circuit to get required signal to ATTiny85:**
+<img width="100%" src="https://raw.githubusercontent.com/mmame/MaerklinMotorolaDecoder/master/MaerklinMotorolaATTiny85SignalSchematic.png">
