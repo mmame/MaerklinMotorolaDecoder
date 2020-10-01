@@ -1,15 +1,30 @@
 //Download the MaerklinMotorola Library from https://github.com/mmame/MaerklinMotorola
+//Add additional board manager url: https://mcudude.github.io/MiniCore/package_MCUdude_MiniCore_index.json
 #include <MaerklinMotorola.h>
 #include <EEPROM.h>
 #include <avr/wdt.h>
+#if not defined (__AVR_ATtiny85__)
+  #include "SoftwareSerial.h"
+#endif
+#include "DFPlayerMini_Fast.h"
 
+/* Default settings when no valid EEPROMData is found */
+#define DEFAULT_MODE   MODE_FUNCTION_DECODER
+//#define DEFAULT_MODE   MODE_SIGNAL
+//#define DEFAULT_MODE   MODE_SOUND_MODULE
+#define DEFAULT_ADDRESS 78                  //1...80  MM2 base address where the function/sound decoder is listening on (only applicable for MODE_FUNCTION_DECODER and MODE_SOUND_MODULE)
+#define DEFAULT_SWITCH_NUMBER 1             //1...320 MM2 switch number where the switch module is listening on (only applicable for MODE_SWITCH and MODE_SIGNAL)
+#define DEFAULT_VOLUME 20                   //0...30  Volume of the played sounds (only applicable for MODE_SOUND_MODULE)
+#define DEFAULT_EXTENDED_ADDRESS_COUNT 1    //0...1   Number of MM2 addresses where the function/sound decoder is listening to i.e. Base address is 78 and DEFAULT_EXTENDED_ADDRESS_COUNT is 2, so we're listening on (base) Address 78 plus 79 and 80 (only applicable for MODE_SOUND_MODULE and MODE_FUNCTION_DECODER)
+
+//Sorry, no room for debugging on ATTiny...
 #if not defined (__AVR_ATtiny85__)
   //comment out the following line to disable serial traces
   #define SERIAL_TRACE
 #endif
 
 //#define TRACE_ALL_MSG
-
+  
 #ifdef SERIAL_TRACE
 #define BAUDRATE            115200
 #define  TRACELN(x)         Serial.println(x)
@@ -26,15 +41,18 @@
 #endif
 
 #if defined (__AVR_ATtiny85__)
+  //#define REDUCE_PROGMEM 1
   #define INVERTED_LOGIC 1
   #define MM_INPUT_PIN  2
   #define OUTPUT_1_PIN  1
   #define OUTPUT_2_PIN  0
   #define BUTTON_FCT    4
+  #define DFPLAYER_RX   3
+  #define DFPLAYER_TX   5
 #else
-  //use function switch on D8 for debugging purposes
-  #define DEBUG_SWITCH
   #define INVERTED_LOGIC 0
+  #define BUTTON_FCT    4
+  #define BUTTON_FCT_INVERTED 1
   #define MM_INPUT_PIN  2
   #define OUTPUT_1_PIN  3
   #define OUTPUT_2_PIN  5
@@ -42,12 +60,8 @@
   #define OUTPUT_4_PIN  9
   #define OUTPUT_5_PIN  10
   #define OUTPUT_6_PIN  11
-  //Direct register access for Switch button on DDB7
-  #define BUTTON_INPUT_REG DDRB
-  #define BUTTON_INPUT_PORT PORTB
-  #define BUTTON_INPUT_PIN DDB7
-  #define BUTTON_INPUT_PORTPIN PORTB7
-  #define BUTTON_FCT_DEBUG 8
+  #define DFPLAYER_RX   A0 
+  #define DFPLAYER_TX   A1
 #endif
 
   
@@ -56,7 +70,8 @@
 typedef enum _MODE{
   MODE_SWITCH = 1,
   MODE_FUNCTION_DECODER,
-  MODE_SIGNAL
+  MODE_SIGNAL,
+  MODE_SOUND_MODULE
 } MODE;
 
 typedef enum _CVWRITESTATE
@@ -75,9 +90,11 @@ typedef enum _CVWRITESTATE
 //Common CV indexes
 #define CV_ADDRESS      0
 #define CV_MODE         1
+#define CV_VOLUME       2
+#define CV_EXTENDED_ADDRESS_COUNT 3
 
 #if defined (__AVR_ATtiny85__)
-  #define CV_COUNT        2
+  #define CV_COUNT        4
 #else
   #define CV_COUNT        80
 #endif
@@ -94,7 +111,7 @@ typedef struct _EEPROM_DATA {
   byte Magic[4];
   unsigned int SwitchNumber;
   unsigned char CV[CV_COUNT];
-  bool Reverse;
+  bool Reverse:1;
   MODE_SIGNAL_STATE LastSignalState;
 } EEPROM_DATA, *PEEPROM_DATA;
 
@@ -103,6 +120,7 @@ EEPROM_DATA EEPROMData;
 volatile MaerklinMotorola mm(MM_INPUT_PIN);
 
 bool IsAddressLearningMode = false;
+unsigned char currentlyPlayingSoundIndex = 0;
 
 typedef enum _LED_MODE{
   LED_MODE_IDLE,
@@ -122,29 +140,39 @@ MODE_SIGNAL_STATE ModeSignalState = MODE_SIGNAL_STATE_UNKNOWN;
 unsigned char FadeStage = 1;
 
 FADE_STATE FadeState = FADE_STATE_IDLE;
-unsigned int FadeValueCurrent = 0;
-int FadePin = 0;
-unsigned long LastFadeTime = 0;
+unsigned char FadeValueCurrent = 0;
+unsigned char FadePin = 0;
+unsigned int LastFadeTime = 0;
 
 #define FADE_STEP_SIZE 15
 #define FADE_STEP_TIME 20
 #define FADE_LOW_VALUE 0
 #define FADE_HIGH_VALUE 1023
 
-bool LedBlinkState = false;
-unsigned long LastLedSwitchTime = millis();
+unsigned int LastLedSwitchTime = millis();
 int LedBlinkIntervalMillis = 500;
-int LedNumberOfBlinks = 0;
+unsigned char LedNumberOfBlinks = 0;
 LED_MODE LedMode = LED_MODE_IDLE;
 
-unsigned long SwitchCoilOnTime = millis();
+unsigned int SwitchCoilOnTime = millis();
+
+bool LedBlinkState = false;
 bool  SwitchedOn = false;
 
-#define MAX_COIL_TIME 500
+#define MAX_COIL_TIME 250
 
 CVWRITESTATE CVWriteState = CVWRITESTATE_IDLE1;
 unsigned char CVWriteAddress = 0;
 unsigned char CVWriteValue = 0;
+
+/* On ATTIny85, we use the builtin Serial port to have more program space */
+#if defined (__AVR_ATtiny85__)
+  #define DFPLAYER_SERIAL Serial
+#else
+  SoftwareSerial dfPlayerSoftwareSerial(DFPLAYER_RX, DFPLAYER_TX);
+  #define DFPLAYER_SERIAL dfPlayerSoftwareSerial
+#endif
+DFPlayerMini_Fast dfPlayer;
 
 unsigned int getSwitchNumber(MaerklinMotorolaData* md)
 {
@@ -157,8 +185,10 @@ unsigned int getSwitchNumber(MaerklinMotorolaData* md)
   return SwitchNumber;
 }
 
-void setLEDMode(LED_MODE newMode, int intervalMillis, int numberOfBlinks)
+//Sorry, not enough flash on ATTiny, so we don't support fancy LED blinky stuff
+void setLEDMode(LED_MODE newMode, int intervalMillis, unsigned char numberOfBlinks)
 {
+  #if not defined (REDUCE_PROGMEM)
   if(newMode != LedMode)
   LedMode = newMode;
   LastLedSwitchTime = millis();
@@ -183,11 +213,12 @@ void setLEDMode(LED_MODE newMode, int intervalMillis, int numberOfBlinks)
     default:
     break;
   }
+  #endif
 }
 
 void setupFadeHighLow()
 {
-  TRACELN(F("setupFadeHighLow"));
+  //TRACELN(F("setupFadeHighLow"));
   FadeState = FADE_STATE_HIGH_LOW;
   FadeValueCurrent = FADE_HIGH_VALUE;
 }
@@ -195,7 +226,7 @@ void setupFadeHighLow()
 
 void setupFadeLowHigh()
 {
-  TRACELN(F("setupFadeLowHigh"));
+  //TRACELN(F("setupFadeLowHigh"));
   FadeState = FADE_STATE_LOW_HIGH;
   FadeValueCurrent = FADE_LOW_VALUE;
 }
@@ -239,8 +270,8 @@ void processFade()
       case FADE_STATE_HIGH_LOW:
       if (millis() - LastFadeTime >= FADE_STEP_TIME)
       {
-        TRACE(F("FADE_STATE_HIGH_LOW "));
-        TRACELN(FadeValueCurrent);
+        //TRACE(F("FADE_STATE_HIGH_LOW "));
+        //TRACELN(FadeValueCurrent);
         LastFadeTime = millis();
         if(FadeValueCurrent > FADE_STEP_SIZE + FADE_LOW_VALUE)
         {
@@ -258,8 +289,8 @@ void processFade()
       case FADE_STATE_LOW_HIGH:
       if (millis() - LastFadeTime >= FADE_STEP_TIME)
       {
-        TRACE(F("FADE_STATE_LOW_HIGH "));
-        TRACELN(FadeValueCurrent);
+        //TRACE(F("FADE_STATE_LOW_HIGH "));
+        //TRACELN(FadeValueCurrent);
         LastFadeTime = millis();
         if(FadeValueCurrent < FADE_HIGH_VALUE - FADE_STEP_SIZE)
         {
@@ -277,8 +308,11 @@ void processFade()
   }
 }
 
+//Sorry, not enough flash on ATTiny, so we don't support fancy LED blinky stuff
 void processLED()
 {
+  
+#if not defined (REDUCE_PROGMEM)
   switch(LedMode)
   {
     case LED_MODE_BLINK_INTERVAL:
@@ -310,6 +344,7 @@ void processLED()
     default:
     break;
   }
+#endif
 }
 
 void loadEEPROM()
@@ -320,10 +355,11 @@ void loadEEPROM()
     //No valid EEPROM data found - load setup defaults (Switch mode, use switch number 1)
     TRACELN(F(" Loading Setup Defaults..."));
     memcpy(EEPROMData.Magic, EEPROM_MAGIC, 4);
-    //EEPROMData.CV[CV_MODE] = MODE_FUNCTION_DECODER;
-    //EEPROMData.CV[CV_ADDRESS] = 5;
-    EEPROMData.CV[CV_MODE] = MODE_SIGNAL;
-    EEPROMData.SwitchNumber = 1;
+    EEPROMData.CV[CV_MODE] = DEFAULT_MODE;
+    EEPROMData.CV[CV_ADDRESS] = DEFAULT_ADDRESS;
+    EEPROMData.CV[CV_VOLUME] = DEFAULT_VOLUME;
+    EEPROMData.CV[CV_EXTENDED_ADDRESS_COUNT] = DEFAULT_EXTENDED_ADDRESS_COUNT;
+    EEPROMData.SwitchNumber = DEFAULT_SWITCH_NUMBER;
     EEPROMData.Reverse = false;
     EEPROMData.LastSignalState = MODE_SIGNAL_STATE_1;
     saveEEPROM();
@@ -355,18 +391,7 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(MM_INPUT_PIN), isr, CHANGE);
 
-#if defined (__AVR_ATtiny85__)
-  pinMode(BUTTON_FCT, INPUT);
-#else
-  #ifdef DEBUG_SWITCH
-    pinMode(BUTTON_FCT_DEBUG, INPUT_PULLUP);
-  #else
-   //Button Switch Pin Configuration: Set as Input by register
-    BUTTON_INPUT_REG &= ~(1 << BUTTON_INPUT_PIN);
-    //Button Switch Pin Configuration: Enable Pullup
-    BUTTON_INPUT_PORT |= (1 << PORTB7);  
-  #endif
-#endif
+  pinMode(BUTTON_FCT, INPUT_PULLUP);
   
   pinMode(LED_BUILTIN, OUTPUT);
   setLEDMode(LED_MODE_OFF, 0, 0);
@@ -381,6 +406,26 @@ void setup() {
 
  loadEEPROM();
 
+ if(MODE_SOUND_MODULE == EEPROMData.CV[CV_MODE])
+ {
+    DFPLAYER_SERIAL.begin(9600);
+    if (dfPlayer.begin(DFPLAYER_SERIAL))
+    {
+      TRACELN(F("DFPlayer online"));
+      dfPlayer.volume(EEPROMData.CV[CV_VOLUME]);
+    }
+    else
+    {
+      //sorry, no sounds available
+      TRACELN(F("Unable to begin:"));
+      TRACELN(F("1.Please recheck the connection!"));
+      TRACELN(F("2.Please insert the SD card!"));
+    }
+ }
+ else
+ {
+ }
+
  delay(500);
  TRACELN(F("YAMMD - Yet Another Maerklin Motorola Decoder - ready"));
 
@@ -392,19 +437,18 @@ void setup() {
 
 bool isButtonPressed()
 {
-  #if defined (__AVR_ATtiny85__)
-    return digitalRead(BUTTON_FCT);
+  #if BUTTON_FCT_INVERTED
+    return !digitalRead(BUTTON_FCT);
   #else
-    #ifdef DEBUG_SWITCH
-      return !digitalRead(BUTTON_FCT_DEBUG);
-    #else
-      return !(PINB & (1 << PB7));
-    #endif
+    return digitalRead(BUTTON_FCT);
   #endif
 }
 
 void checkForCVWriteMode(MaerklinMotorolaData* Data)
 {
+  //TODO: WIP, so that doesn't work so far :->
+
+  
     /*Programming Sequence:
       1. Send the following sequence to current decoder address:
         Stop 1, ChangeDir 0
@@ -528,7 +572,7 @@ void writeCV(unsigned char address, unsigned char value)
   TRACELN(F("CV Programming - Set CV ")); TRACE((address)); TRACE((" value ")); TRACE((value));
   EEPROMData.CV[address] = value;
   saveEEPROM();
-  //blink 2 times
+  //blink n times
   setLEDMode(LED_MODE_BLINK_NUMBER, 500, 3);
 }
 
@@ -548,6 +592,7 @@ void checkForAddressLearningMode()
     break;
     
     case MODE_FUNCTION_DECODER:
+    case MODE_SOUND_MODULE:
     //Todo: Set IsAddressLearningMode i.e. when switching direction of train for 5 times
     break;
     
@@ -560,16 +605,15 @@ void checkForAddressLearningMode()
 
 void traceMMMessage(MaerklinMotorolaData* Data)
 {
-  #if defined (TRACE_ALL_MSG)
     if(Data)
     {
       TRACE(millis());
-      TRACE(F(" Trits: "));
-      for(int i=0;i<9;i++) 
+      TRACE(F(" Bits: "));
+      for(unsigned char i=0;i<18;i++) 
       {
-        Serial.print(Data->Trits[i]);
+        TRACEF(IsBitSet(Data->Bits, i), DEC);
       }
-      
+
       TRACE(F(" - Address: ")); TRACE(Data->Address);
       TRACE(F(" - SubAddress: ")); TRACE(Data->SubAddress);
       TRACE(F(" - Function: ")); TRACE(Data->Function);
@@ -591,7 +635,6 @@ void traceMMMessage(MaerklinMotorolaData* Data)
       }
       TRACELN();
     }
-  #endif
 }
 
 void prepareSignalState(MODE_SIGNAL_STATE newState)
@@ -730,14 +773,58 @@ void processMMDataAsSwitch(MaerklinMotorolaData* Data)
 
 void processMMDataAsFunctionDecoder(MaerklinMotorolaData* Data)
 {
+  unsigned char selectedFunction = 0;
+  bool isFunctionOn = false;
+  unsigned char addressOffset = 0;
+  
   checkForCVWriteMode(Data);
+  
   if(Data) 
   {
     if(!Data->IsMagnet)
     {
-      if(EEPROMData.CV[CV_ADDRESS] == Data->Address)
+      addressOffset = Data->Address - EEPROMData.CV[CV_ADDRESS];
+      //check if address matches base or one of the extended addresses
+      if(addressOffset >= 0 && addressOffset <= EEPROMData.CV[CV_EXTENDED_ADDRESS_COUNT])
       {
-        //TODO: Implement...
+        #ifndef TRACE_ALL_MSG
+        traceMMMessage(Data);
+        #endif
+
+        if(Data->MM2FunctionIndex != 0)
+        {
+          selectedFunction = Data->MM2FunctionIndex + addressOffset * 4;
+          isFunctionOn = Data->IsMM2FunctionOn;
+        }
+        else if(addressOffset == 0) 
+        {
+          //FCT 0 (mainly used for main front/back light switch)
+          selectedFunction = 0;
+          isFunctionOn = Data->Function;
+        }
+        
+        if(MODE_SOUND_MODULE == EEPROMData.CV[CV_MODE])
+        {
+          //Sound module expects a DFPlayer Mini on DFPLAYER Pins.
+          if(0 < selectedFunction && isFunctionOn)
+          {
+            if(currentlyPlayingSoundIndex != selectedFunction)
+            {
+              dfPlayer.playFromMP3Folder(selectedFunction);
+            }
+          }
+        }
+        else
+        {
+          if(0 <= selectedFunction)
+          {
+            //TODO: Implement...
+            TRACE(F("SelectedFunction "));
+            TRACE(selectedFunction);
+            TRACE(F(" IsOn "));
+            TRACELN(isFunctionOn);
+          }
+        }
       }
     }
   }
@@ -745,9 +832,11 @@ void processMMDataAsFunctionDecoder(MaerklinMotorolaData* Data)
 
 void processMMData()
 {
-  mm.Parse();
   MaerklinMotorolaData* Data = mm.GetData();
+
+#if defined(TRACE_ALL_MSG)
   traceMMMessage(Data);
+#endif  
 
   switch(EEPROMData.CV[CV_MODE])
   {
@@ -757,6 +846,7 @@ void processMMData()
     break;
     
     case MODE_FUNCTION_DECODER:
+    case MODE_SOUND_MODULE:
     processMMDataAsFunctionDecoder(Data);
     break;
     
@@ -771,6 +861,12 @@ void loop() {
   processMMData();
   processLED();
   processFade();
+}
+
+void processDFPlayer(){
+  if(currentlyPlayingSoundIndex && !dfPlayer.isPlaying()){
+    currentlyPlayingSoundIndex = 0;
+  }
 }
 
 void isr() {
